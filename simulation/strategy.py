@@ -19,6 +19,7 @@ import numpy as np
 import auxiliary.grid2op_util as g2o_util
 from auxiliary.config import get_config, NetworkType
 import training.models
+from auxiliary.generate_action_space import get_env_actions
 from training import postprocessing
 from training.models import Model, FCNN, GCN
 from data_preprocessing_analysis.data_preprocessing import reduced_env_variables, extract_gen_features, \
@@ -29,6 +30,14 @@ class AgentStrategy(ABC):
     """
     Abstract base class (ABC) for a strategy.
     """
+
+    # @property
+    # @abstractmethod
+    # def model(self):
+    #     """
+    #     Require declaration of the model attribute.
+    #     """
+    #     pass
 
     @abstractmethod
     def select_action(self,
@@ -223,16 +232,13 @@ class IdleStrategy(AgentStrategy):
 class GreedyStrategy(AgentStrategy):
 
     def __init__(self,
-                 do_nothing_action: grid2op.Action.BaseAction,
-                 reduced_action_list: Sequence[grid2op.Action.TopologyAction],
+                 env: grid2op.Environment.Environment,
                  suppress_warning: bool = False):
         """
         Parameters
         ----------
-        do_nothing_action : grid2op.Action.BaseAction
-            The do-nothing action.
-        reduced_action_list : Sequence[grid2op.Action.TopologyAction]
-            The reduced action list, containing the actions simulated and selected from by the greedy agent.
+        env : grid2op.Environment
+            The environment.
         suppress_warning : bool
             Whether to suppress warnings during initialization.
         """
@@ -241,8 +247,13 @@ class GreedyStrategy(AgentStrategy):
         # Set fields
         config = get_config()
         self.activity_threshold = config['simulation']['activity_threshold']
-        self.do_nothing_action = do_nothing_action
-        self.reduced_action_list = reduced_action_list
+        self.do_nothing_action = env.action_space({})
+
+        # Create action spaces per (N-1) network
+        lout_considered = config['simulation']['opponent']['attack_lines'].copy()
+        lout_considered.append(-1)
+        self.lout_considered = lout_considered
+        self.action_list_per_lo = {line: get_env_actions(env, disable_line=line) for line in lout_considered}
 
         # Raise warning
         if not suppress_warning:
@@ -269,16 +280,19 @@ class GreedyStrategy(AgentStrategy):
             A dictionary which contains information about the action, or None. None is returned if the datapoint should
             not be saved as action.
         """
+        disabled_lines = [line for line in np.where(~observation.line_status)[0] if line in self.lout_considered]
+        action_list = self.action_list_per_lo[-1 if len(disabled_lines) == 0 else disabled_lines[0]]
+
         if observation.rho.max() > self.activity_threshold:
             best_action = self.do_nothing_action
             best_action_index = -1
             do_nothing_rho = best_rho = self.get_max_rho_simulated(observation, best_action)
 
             # Simulate each action
-            for index, action in enumerate(self.reduced_action_list):
+            for index, action in enumerate(action_list):
 
                 # Skip any action that tries to change a line status
-                if (action._lines_impacted is not None) and sum(action._lines_impacted) > 0:
+                if (not action._lines_impacted is None) and sum(action._lines_impacted) > 0:
                     continue
 
                 # Obtain the max. rho of the observation resulting from the simulated action
@@ -562,7 +576,8 @@ class VerifyStrategy(AgentStrategy):
         self.feature_statistics = feature_statistics
         self.action_space = action_space
 
-        # Initialize the action space cache used for matching predictions to actions
+        # Initialize action space cache used for
+        config = get_config()
         lout_considered = config['training']['settings']['line_outages_considered']
         self.as_cache = postprocessing.ActSpaceCache(line_outages_considered=lout_considered)
 
@@ -611,7 +626,8 @@ class MaxRhoThresholdHybridStrategy(AgentStrategy):
 
     def __init__(self,
                  lower_strategy: AgentStrategy,
-                 higher_strategy: AgentStrategy):
+                 higher_strategy: AgentStrategy,
+                 suppress_warning: bool = False):
         """
         Parameters
         ----------
@@ -619,14 +635,19 @@ class MaxRhoThresholdHybridStrategy(AgentStrategy):
             The strategy to use if the max.rho does not exceed the threshold.
         higher_strategy : AgentStrategy
             The strategy to use if the max.rho does exceed the threshold.
+        suppress_warning : bool
+            Whether to suppress warnings during initialization.
         """
         super()
-
         # Set fields
         config = get_config()
         self.switch_control_threshold = config['simulation']['hybrid_strategies']['take_the_wheel_threshold']
         self.lower_strategy = lower_strategy
         self.higher_strategy = higher_strategy
+
+        if not suppress_warning:
+            warnings.warn("\nSaving actions as datapoints is not supported by class VerifyNMinusOneHybridStrategy; " +
+                          "\nthe second output of the select_action method is always None.", stacklevel=2)
 
     def select_action(self, observation: grid2op.Observation.CompleteObservation) \
             -> Tuple[grid2op.Action.BaseAction, None]:
@@ -650,6 +671,58 @@ class MaxRhoThresholdHybridStrategy(AgentStrategy):
             return action, None
         else:
             action, _ = self.lower_strategy.select_action(observation)
+            return action, None
+
+
+class LineOutageHybridStrategy(AgentStrategy):
+    """
+    Hybrid strategy, that determines
+    Strategy that combines the Greedy Hybrid and N-1 hybrid agents. The latter is used in the full topology;
+    the former, in the topology with outages.
+    """
+
+    def __init__(self,
+                 no_lineout_strategy: AgentStrategy,
+                 lineout_strategy: AgentStrategy):
+        """
+        Parameters
+        ----------
+        no_lineout_strategy : AgentStrategy
+            The strategy used when there's no line outage.
+        lineout_strategy : AgentStrategy
+        """
+        super()
+        self.no_lineout_strategy = no_lineout_strategy
+        self.lineout_strategy = lineout_strategy
+
+        config = get_config()
+        lout_considered = config['simulation']['opponent']['attack_lines'].copy()
+        self.lout_considered = lout_considered
+
+    def select_action(self, observation: grid2op.Observation.CompleteObservation) \
+            -> Tuple[grid2op.Action.BaseAction, None]:
+        """
+        Selects an action.
+
+        Parameters
+        ----------
+        observation :  grid2op.Observation.CompleteObservation
+            The observation, on which to base the action.
+
+        Returns
+        -------
+        action_chosen : grid2op.Action.BaseAction
+            The selected action.
+        None
+            An optional dictionary which contains information about the action. Not provided by this subclass.
+        """
+        any_line_disabled = any(line in self.lout_considered for line in np.where(~observation.line_status)[0])
+
+        if any_line_disabled:
+            action, _ = self.lineout_strategy.select_action(observation)
+            return action, None
+        else:
+            action, _ = self.no_lineout_strategy.select_action(observation)
             return action, None
 
 

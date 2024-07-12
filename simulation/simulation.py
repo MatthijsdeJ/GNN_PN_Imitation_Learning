@@ -9,6 +9,7 @@ import logging
 import os
 from typing import List, Dict
 import time
+import random
 
 # Third-party library imports
 import grid2op
@@ -84,6 +85,11 @@ def simulate():
             start_day_time = time.thread_time_ns() / 1e9
 
             # While scenario is not completed
+            # Create opponent variables
+            attack1_begin, attack1_end, attack1_line, attack2_begin, attack2_end, attack2_line \
+                = _create_opponent_variables()
+
+            # While chronic is not completed
             while env.nb_time_step < env.chronics_handler.max_timestep():
 
                 # Reset at midnight, add day data to scenario data
@@ -98,6 +104,10 @@ def simulate():
 
                     # Reset topology
                     env_step_raise_exception(env, env.action_space({'set_bus': reference_topo_vect}))
+
+                    # Reset opponent
+                    attack1_begin, attack1_end, attack1_line, attack2_begin, attack2_end, attack2_line \
+                        = _create_opponent_variables(env.nb_time_step)
 
                     # Save and reset data
                     if save_data:
@@ -118,8 +128,54 @@ def simulate():
                 assert (action._subs_impacted is None) or (sum(action._subs_impacted) < 2), \
                     "Actions should at most impact a single substation."
                 assert (action._lines_impacted is None) or (sum(action._lines_impacted) < 1), \
-                    ("Action should not impact the line status.")
+                    "Action should not impact the line status."
 
+                timestep = env.nb_time_step
+
+                # Disable lines
+                if env.nb_time_step in [attack1_begin, attack2_begin]:
+                    attack_line = attack1_line if env.nb_time_step == attack1_begin else attack2_line
+                    action = env.action_space({
+                        'set_bus': action.set_bus.copy(),
+                        'change_bus': action.change_bus.copy(),
+                        'set_line_status': (attack_line, -1)})
+
+                    # Actions can be ambiguous if a line endpoint is simultaneously acted on and disabled
+                    # If so, we do do not perform the action
+                    try:
+                        action._check_for_ambiguity()
+                        amb = action.is_ambiguous()
+                        if amb[0]:
+                            raise amb[1]
+                    except Exception:
+                        action = env.action_space({'set_line_status': (attack_line, -1)})
+
+                # Assert check disabled lines
+                if attack1_begin < timestep < attack1_end:
+                    assert obs.line_status[attack1_line] == False
+                if attack2_begin < timestep < attack2_end:
+                    assert obs.line_status[attack2_line] == False
+
+                # Re-enable lines
+                if env.nb_time_step in [attack1_end, attack2_end]:
+                    attack_line = attack1_line if env.nb_time_step == attack1_end else attack2_line
+                    action = env.action_space({
+                        'set_bus': action.set_bus.copy(),
+                        'change_bus': action.change_bus.copy(),
+                        'set_line_status': (attack_line, 1)})
+                    log_and_print(f"{env.nb_time_step}: Line {attack_line} no longer disabled by attack.")
+
+                    # Actions can be ambiguous if a line endpoint is simultaneously acted on and disabled
+                    # If so, we do do not perform the action
+                    try:
+                        action._check_for_ambiguity()
+                        amb = action.is_ambiguous()
+                        if amb[0]:
+                            raise amb[1]
+                    except grid2op.Exceptions.ambiguousActionExceptions.InvalidLineStatus:
+                        action = env.action_space({'set_line_status': (attack_line, 1)})
+
+                # Take the selected action in the environment
                 # Apply the selected action in the environment
                 previous_max_rho = obs.rho.max()
                 previous_topo_vect = obs.topo_vect
@@ -152,19 +208,69 @@ def simulate():
                     g2o_util.skip_to_next_day(env, ts_in_day, int(env.chronics_handler.get_name()), disable_line)
                     day_datapoints = []
                     start_day_time = time.thread_time_ns() / 1e9
+                    # Reset opponent
+                    attack1_begin, attack1_end, attack1_line, attack2_begin, attack2_end, attack2_line \
+                        = _create_opponent_variables(env.nb_time_step)
 
             # At the end of a scenario, print a message, and store and reset the corresponding records
             log_and_print(f'{env.nb_time_step}: Scenario exhausted! \n\n\n')
 
             # Saving and resetting the data
             if save_data:
-                save_records(scenario_datapoints, int(env.chronics_handler.get_name()), days_completed)
-
+                save_records(chronic_datapoints, int(env.chronics_handler.get_name()), days_completed)
         except (grid2op.Exceptions.DivergingPowerFlow, grid2op.Exceptions.BackendError) as e:
             log_and_print(f'{env.nb_time_step}: Uncaught exception encountered on ' +
                           f'day {ts_to_day(env.nb_time_step, ts_in_day)}: {e}.' +
                           ("" if not hasattr(e, '__notes__') else " ".join(e.__notes__)) +
                           ". Skipping this scenario. \n\n\n")
+
+
+def _create_opponent_variables(day_offset: int = 0, ts_in_day: int = 24*12):
+    """
+    Create the opponent variables:
+    attack1_begin, attack1_end, attack1_line, attack2_begin, attack2_end, attack2_line
+
+
+    Parameters
+    ----------
+    day_offset : int
+        The timestep that denotes the start of the day.
+
+    Returns
+    -------
+    attack1_begin : int
+        The timestep where the first attack starts.
+    attack1_end : int
+        The timestep where the first attack ends.
+    attack1_line : int
+        The line disabled by the first attack.
+    attack2_begin : int
+        The timestep where the second attack ends.
+    attack2_end : int
+        The timestep where the second attack ends.
+    attack2_line : int
+        The line disabled by the second attack.
+    """
+    config = get_config()
+    attack_lines = config['simulation']['opponent']['attack_lines']
+    attack_duration = config['simulation']['opponent']['attack_duration']
+    attack_cooldown = config['simulation']['opponent']['attack_cooldown']
+
+    attack1_begin = min(random.randint(1, ts_in_day - 2 * attack_duration - attack_cooldown - 2),
+                        random.randint(1, ts_in_day - 2 * attack_duration - attack_cooldown - 2))
+    attack1_end = attack1_begin + attack_duration
+    attack1_line = random.choice(attack_lines)
+
+    attack2_begin = random.randint(attack1_end + attack_cooldown, ts_in_day - attack_duration - 1)
+    attack2_end = attack2_begin + attack_duration
+    attack2_line = random.choice(attack_lines)
+
+    attack1_begin += day_offset
+    attack1_end += day_offset
+    attack2_begin += day_offset
+    attack2_end += day_offset
+
+    return attack1_begin, attack1_end, attack1_line, attack2_begin, attack2_end, attack2_line
 
 
 def log_and_print(msg: str):
@@ -242,8 +348,7 @@ def init_agent(env: grid2op.Environment) -> strat.Agent:
     if strategy_type == StrategyType.IDLE:
         strategy = strat.IdleStrategy(env.action_space({}))
     elif strategy_type == StrategyType.GREEDY:
-        strategy = strat.GreedyStrategy(env.action_space({}),
-                                        get_env_actions(env, disable_line=config['simulation']['disable_line']))
+        strategy = strat.GreedyStrategy(env)
     elif strategy_type == StrategyType.N_MINUS_ONE:
         strategy = strat.NMinusOneStrategy(env.action_space,
                                            get_env_actions(env, disable_line=config['simulation']['disable_line']))
@@ -274,11 +379,31 @@ def init_agent(env: grid2op.Environment) -> strat.Agent:
 
         # Initialize strategies
         verify_strategy = strat.VerifyStrategy(model, feature_statistics, env.action_space, False)
-        greedy_strategy = strat.GreedyStrategy(env.action_space({}),
-                                               get_env_actions(env, disable_line=config['simulation']['disable_line']),
-                                               False)
+        greedy_strategy = strat.GreedyStrategy(env, False)
         strategy = strat.MaxRhoThresholdHybridStrategy(verify_strategy, greedy_strategy)
     elif strategy_type == StrategyType.VERIFY_N_MINUS_ONE_HYBRID:
+        # Initialize model and normalization statistics
+        model = init_model()
+        feature_statistics_path = config['paths']['data']['processed'] + 'auxiliary_data_objects/feature_stats.json'
+        with open(feature_statistics_path, 'r') as file:
+            feature_statistics = json.loads(file.read())
+
+        # Initialize nminusone actions
+        nminusone_actions = get_env_actions(env, disable_line=config['simulation']['disable_line'])
+
+        # Initialize strategies
+        verify_strategy = strat.VerifyStrategy(model, feature_statistics, env.action_space, False)
+        nminusone_strategy = strat.NMinusOneStrategy(env.action_space, nminusone_actions, False)
+        strategy = strat.MaxRhoThresholdHybridStrategy(verify_strategy, nminusone_strategy)
+    elif strategy_type == StrategyType.GREEDY_N_MINUS_ONE_HYBRID:
+        # Initialize nminusone
+        nminusone_actions = get_env_actions(env, disable_line=config['simulation']['disable_line'])
+
+        # Initialize strategies
+        greedy_strategy = strat.GreedyStrategy(env, False)
+        nminusone_strategy = strat.NMinusOneStrategy(env.action_space, nminusone_actions, False)
+        strategy = strat.LineOutageHybridStrategy(nminusone_strategy, greedy_strategy)
+    elif strategy_type == StrategyType.THREEBRID:
         # Initialize model and normalization statistics
         model = init_model()
         feature_statistics_path = config['paths']['data']['processed'] + 'auxiliary_data_objects/feature_stats.json'
@@ -288,10 +413,15 @@ def init_agent(env: grid2op.Environment) -> strat.Agent:
         # Initialize nminusone
         nminusone_actions = get_env_actions(env, disable_line=config['simulation']['disable_line'])
 
-        # Initialize strategies
+        # Creating strategies
         verify_strategy = strat.VerifyStrategy(model, feature_statistics, env.action_space, False)
+        greedy_strategy = strat.GreedyStrategy(env, False)
         nminusone_strategy = strat.NMinusOneStrategy(env.action_space, nminusone_actions, False)
-        strategy = strat.MaxRhoThresholdHybridStrategy(verify_strategy, nminusone_strategy)
+
+        # Creating hybrid strategies
+        greedy_hybrid_strategy = strat.MaxRhoThresholdHybridStrategy(verify_strategy, greedy_strategy)
+        nminusone_hybrid_strategy = strat.MaxRhoThresholdHybridStrategy(verify_strategy, nminusone_strategy)
+        strategy = strat.LineOutageHybridStrategy(nminusone_hybrid_strategy, greedy_hybrid_strategy)
     else:
         raise ValueError("Invalid value for strategy_name.")
 
