@@ -1,8 +1,8 @@
-Code accompanying the study by de Jong et al. 'todo: paper title' todo:paper link. The setting with unplanned outages is implemented in the 'unplanned_outages' branch. Please reach out to me through matthijsdj@live.nl .
+Code accompanying the study by de Jong et al. "[Generalizable Graph Neural Networks for Robust Power Grid Topology Control](https://arxiv.org/abs/2501.07186)". The setting with unplanned outages is implemented in the 'unplanned_outages' branch. Please reach out to me through matthijsdj@live.nl .
 
 This repository is provided for transparancy, reproducability, and re-use in future projects. However, this project will not be further maintained. Additionally, certain parts of the projects might require additional work. In particular:
 - This project uses the `rte_case14_realistic` environment, which has since been deprecated. Future research should use `l2rpn_case14_sandbox`.
-- Saving state-experts pairs currently involves saving the Grid2Op environment with `to_vect()` function of the `Observation` class. However, this representation is not forward compatible: the vector representation might change between Grid2Op versions, making loading vectors from previous versions impossible
+- Saving state-experts pairs currently involves saving the Grid2Op environment with `to_vect()` function of the `Observation` class. However, this representation is not forward compatible: the vector representation might change between Grid2Op versions, making loading vectors from previous versions impossible.
 - The intra-day setup, where scenarios are split into seperate days, does not work harmoniously with Grid2Op. Extensions to the environent, e.g. the inclusion of a Grid2Op opponent, clash with the functionality for splitting days. I would recommend against the usage of this implementation in future projects, in favor of a better integrated implementation.
 
 The project can be mostly divided in three stages:
